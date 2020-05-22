@@ -1,30 +1,46 @@
-import logging
-from typing import Text, List
+import asyncio
+import random
+import uuid
+
+from sanic.request import Request
+from sanic.testing import SanicTestClient
+
+from typing import Tuple, Iterator
 
 import pytest
-from _pytest.logging import LogCaptureFixture
 from _pytest.tmpdir import TempdirFactory
+from pathlib import Path
 from sanic import Sanic
+from typing import Text, List, Optional, Dict, Any
+from unittest.mock import Mock
 
 from rasa import server
 from rasa.core import config
 from rasa.core.agent import Agent, load_agent
+from rasa.core.brokers.broker import EventBroker
 from rasa.core.channels import channel
 from rasa.core.channels.channel import RestInput
+from rasa.core.domain import SessionConfig
+from rasa.core.events import UserUttered
+from rasa.core.exporter import Exporter
 from rasa.core.policies import Policy
 from rasa.core.policies.memoization import AugmentedMemoizationPolicy
 from rasa.core.run import _create_app_without_api
+from rasa.core.tracker_store import InMemoryTrackerStore, TrackerStore
 from rasa.model import get_model
 from rasa.train import train_async
 from rasa.utils.common import TempDirectoryPath
+import rasa.utils.io as io_utils
 from tests.core.conftest import (
-    DEFAULT_STORIES_FILE,
     DEFAULT_DOMAIN_PATH_WITH_SLOTS,
-    DEFAULT_STACK_CONFIG,
     DEFAULT_NLU_DATA,
+    DEFAULT_STACK_CONFIG,
+    DEFAULT_STORIES_FILE,
     END_TO_END_STORY_FILE,
     MOODBOT_MODEL_PATH,
+    INCORRECT_NLU_DATA,
 )
+
 
 DEFAULT_CONFIG_PATH = "rasa/cli/default_config.yml"
 
@@ -32,21 +48,22 @@ DEFAULT_CONFIG_PATH = "rasa/cli/default_config.yml"
 # from a separatedly installable pytest-cli plugin.
 pytest_plugins = ["pytester"]
 
+# https://github.com/pytest-dev/pytest-asyncio/issues/68
+# this event_loop is used by pytest-asyncio, and redefining it
+# is currently the only way of changing the scope of this fixture
+@pytest.yield_fixture(scope="session")
+def event_loop(request: Request) -> Iterator[asyncio.AbstractEventLoop]:
+    loop = asyncio.get_event_loop_policy().new_event_loop()
+    yield loop
+    loop.close()
 
-@pytest.fixture(autouse=True)
-def set_log_level_debug(caplog: LogCaptureFixture) -> None:
-    # Set the post-test log level to DEBUG for failing tests.  For all tests
-    # (failing and successful), the live log level can be additionally set in
-    # `setup.cfg`. It should be set to WARNING.
-    caplog.set_level(logging.DEBUG)
 
-
-@pytest.fixture
-async def default_agent(tmpdir_factory: TempdirFactory) -> Agent:
+@pytest.fixture(scope="session")
+async def _trained_default_agent(tmpdir_factory: TempdirFactory) -> Tuple[Agent, str]:
     model_path = tmpdir_factory.mktemp("model").strpath
 
     agent = Agent(
-        "data/test_domains/default.yml",
+        "data/test_domains/default_with_slots.yml",
         policies=[AugmentedMemoizationPolicy(max_history=3)],
     )
 
@@ -54,6 +71,18 @@ async def default_agent(tmpdir_factory: TempdirFactory) -> Agent:
     agent.train(training_data)
     agent.persist(model_path)
     return agent
+
+
+def reset_conversation_state(agent: Agent) -> Agent:
+    # Clean tracker store after each test so tests don't affect each other
+    agent.tracker_store = InMemoryTrackerStore(agent.domain)
+    agent.domain.session_config = SessionConfig.default()
+    return agent
+
+
+@pytest.fixture
+async def default_agent(_trained_default_agent: Agent) -> Agent:
+    return reset_conversation_state(_trained_default_agent)
 
 
 @pytest.fixture(scope="session")
@@ -68,22 +97,22 @@ async def trained_moodbot_path() -> Text:
 
 @pytest.fixture(scope="session")
 async def unpacked_trained_moodbot_path(
-    trained_moodbot_path: Text
+    trained_moodbot_path: Text,
 ) -> TempDirectoryPath:
     return get_model(trained_moodbot_path)
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 async def stack_agent(trained_rasa_model: Text) -> Agent:
     return await load_agent(model_path=trained_rasa_model)
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 async def core_agent(trained_core_model: Text) -> Agent:
     return await load_agent(model_path=trained_core_model)
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 async def nlu_agent(trained_nlu_model: Text) -> Agent:
     return await load_agent(model_path=trained_nlu_model)
 
@@ -109,6 +138,11 @@ def default_nlu_data() -> Text:
 
 
 @pytest.fixture(scope="session")
+def incorrect_nlu_data() -> Text:
+    return INCORRECT_NLU_DATA
+
+
+@pytest.fixture(scope="session")
 def end_to_end_story_file() -> Text:
     return END_TO_END_STORY_FILE
 
@@ -118,16 +152,26 @@ def default_config() -> List[Policy]:
     return config.load(DEFAULT_CONFIG_PATH)
 
 
-@pytest.fixture()
+@pytest.fixture(scope="session")
+def trained_async(tmpdir_factory):
+    async def _train(*args, output_path=None, **kwargs):
+        if output_path is None:
+            output_path = str(tmpdir_factory.mktemp("models"))
+
+        return await train_async(*args, output_path=output_path, **kwargs)
+
+    return _train
+
+
+@pytest.fixture(scope="session")
 async def trained_rasa_model(
+    trained_async,
     default_domain_path: Text,
-    default_config: List[Policy],
     default_nlu_data: Text,
     default_stories_file: Text,
 ) -> Text:
-    clean_folder("models")
-    trained_stack_model_path = await train_async(
-        domain="data/test_domains/default.yml",
+    trained_stack_model_path = await trained_async(
+        domain=default_domain_path,
         config=DEFAULT_STACK_CONFIG,
         training_files=[default_nlu_data, default_stories_file],
     )
@@ -135,14 +179,14 @@ async def trained_rasa_model(
     return trained_stack_model_path
 
 
-@pytest.fixture()
+@pytest.fixture(scope="session")
 async def trained_core_model(
+    trained_async,
     default_domain_path: Text,
-    default_config: List[Policy],
     default_nlu_data: Text,
     default_stories_file: Text,
 ) -> Text:
-    trained_core_model_path = await train_async(
+    trained_core_model_path = await trained_async(
         domain=default_domain_path,
         config=DEFAULT_STACK_CONFIG,
         training_files=[default_stories_file],
@@ -151,14 +195,15 @@ async def trained_core_model(
     return trained_core_model_path
 
 
-@pytest.fixture()
+@pytest.fixture(scope="session")
 async def trained_nlu_model(
+    trained_async,
     default_domain_path: Text,
     default_config: List[Policy],
     default_nlu_data: Text,
     default_stories_file: Text,
 ) -> Text:
-    trained_nlu_model_path = await train_async(
+    trained_nlu_model_path = await trained_async(
         domain=default_domain_path,
         config=DEFAULT_STACK_CONFIG,
         training_files=[default_nlu_data],
@@ -202,10 +247,36 @@ async def rasa_server_without_api() -> Sanic:
     return app
 
 
-def clean_folder(folder: Text) -> None:
-    import os
+def get_test_client(server: Sanic) -> SanicTestClient:
+    test_client = server.test_client
+    test_client.port = None
+    return test_client
 
-    if os.path.exists(folder):
-        import shutil
 
-        shutil.rmtree(folder)
+def write_endpoint_config_to_yaml(
+    path: Path, data: Dict[Text, Any], endpoints_filename: Text = "endpoints.yml"
+) -> Path:
+    endpoints_path = path / endpoints_filename
+
+    # write endpoints config to file
+    io_utils.write_yaml_file(data, endpoints_path)
+    return endpoints_path
+
+
+def random_user_uttered_event(timestamp: Optional[float] = None) -> UserUttered:
+    return UserUttered(
+        uuid.uuid4().hex,
+        timestamp=timestamp if timestamp is not None else random.random(),
+    )
+
+
+class MockExporter(Exporter):
+    """Mocked `Exporter` object."""
+
+    def __init__(
+        self,
+        tracker_store: TrackerStore = Mock(),
+        event_broker: EventBroker = Mock(),
+        endpoints_path: Text = "",
+    ) -> None:
+        super().__init__(tracker_store, event_broker, endpoints_path)
